@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import telebot
 import subprocess
 import os
@@ -50,9 +49,6 @@ ADMIN_ID = int(os.getenv('ADMIN_ID', 7658271153))
 YOUR_USERNAME = os.getenv('YOUR_USERNAME', '@Rolexseller1')
 UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'HINDUSTANHACK')
 
-FORWARD_BOT_TOKEN = "8890034549:AAGl6Cc2j4nIG5TDOwoD9ujX3jLtxsfuKS4"
-FORWARD_BOT = telebot.TeleBot(FORWARD_BOT_TOKEN)
-
 PRIVATE_CHANNEL_ID = -1003977505145
 
 DEFAULT_MANDATORY_CHANNELS = [
@@ -62,6 +58,9 @@ DEFAULT_MANDATORY_CHANNELS = [
 
 FREE_USER_LIMIT = 1
 TRIAL_DAYS = 15
+
+# Auto-refresh: user bots restart every 24h to clear RAM. Admin/Owner exempt.
+REFRESH_INTERVAL_SECONDS = 24 * 3600
 
 PLAN_LIMITS = {
     'free':     {'files': 1,   'ram_mb': 312,  'label': '🆓 Free'},
@@ -195,7 +194,6 @@ load_data()
 # DISK SCAN — ORPHAN FILES RECOVERY
 # ============================================================
 def scan_disk_for_user_files(uid):
-    """Disk pe jo bhi .py/.js files hain user folder mein."""
     folder = get_user_folder(uid)
     found = []
     try:
@@ -215,7 +213,6 @@ def scan_disk_for_user_files(uid):
     return found
 
 def sync_user_files_from_disk(uid):
-    """Disk aur DB ko sync karo — orphans recover, stale remove."""
     disk_files = dict(scan_disk_for_user_files(uid))
     db_files = {fn: ft for fn, ft in user_files.get(uid, [])}
     added = 0
@@ -268,7 +265,6 @@ def get_plan_ram_limit(uid):
     return PLAN_LIMITS.get(get_user_plan(uid), PLAN_LIMITS['free'])['ram_mb']
 
 def get_plan_file_limit(uid):
-    """Admin/Owner/Lifetime = unlimited."""
     if uid == OWNER_ID or uid in admin_ids:
         return float('inf')
     if uid in user_limits: return user_limits[uid]
@@ -406,32 +402,48 @@ def remove_running_process(uid, fn):
         finally: conn.close()
 
 def rehydrate_running_processes():
+    """Reattach to detached processes. Preserves original start time so 24h refresh timer survives restart."""
     logger.info("Rehydrating running processes...")
     count = 0
     stale = []
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        rows = c.execute('SELECT user_id, file_name, pid, file_type FROM running_processes').fetchall()
+        rows = c.execute(
+            'SELECT user_id, file_name, pid, file_type, started_at FROM running_processes'
+        ).fetchall()
         conn.close()
-        for uid, fn, pid, ft in rows:
+        for uid, fn, pid, ft, started_at in rows:
             try:
                 if not psutil.pid_exists(pid):
                     stale.append((uid, fn)); continue
                 p = psutil.Process(pid)
                 if p.status() == psutil.STATUS_ZOMBIE:
                     stale.append((uid, fn)); continue
+                try:
+                    cmdline = " ".join(p.cmdline())
+                    base = os.path.splitext(fn)[0]
+                    if fn not in cmdline and base not in cmdline:
+                        logger.warning(f"⚠️ PID {pid} cmdline mismatch for {uid}/{fn}. Skipping.")
+                        stale.append((uid, fn)); continue
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    pass
                 key = f"{uid}_{fn}"
                 folder = get_user_folder(uid)
                 lp = os.path.join(folder, f"{os.path.splitext(fn)[0]}.log")
                 lf = None
                 try: lf = open(lp, 'a', encoding='utf-8', errors='ignore')
                 except: pass
+                try:
+                    real_start = datetime.fromisoformat(started_at) if started_at else datetime.now()
+                except:
+                    real_start = datetime.now()
                 bot_scripts[key] = {
                     'process': p, 'pid': pid, 'log_file': lf, 'file_name': fn,
                     'chat_id': uid, 'script_owner_id': uid,
-                    'start_time': datetime.now(), 'user_folder': folder,
-                    'type': ft, 'script_key': key, 'rehydrated': True
+                    'start_time': real_start, 'user_folder': folder,
+                    'type': ft, 'script_key': key, 'rehydrated': True,
+                    'last_refresh': None
                 }
                 count += 1
                 logger.info(f"♻️ Rehydrated: {key} PID={pid}")
@@ -454,47 +466,179 @@ def get_process_ram_mb(pid):
     except: return 0
 
 # ============================================================
-# RAM MONITOR
+# RAM MONITOR — WARN ONLY, NEVER KILL
 # ============================================================
 def ram_monitor_loop():
-    logger.info("RAM Monitor started")
+    """Monitor RAM but NEVER kill. Warns only. Users paid for X days → get X days."""
+    logger.info("RAM Monitor started (warn-only mode)")
+    last_warn = {}
+    WARN_COOLDOWN = 3600
     while True:
         try:
-            time.sleep(30)
+            time.sleep(60)
             for key, info in list(bot_scripts.items()):
                 try:
-                    proc = info.get('process')
-                    pid = info.get('pid') or (proc.pid if proc and hasattr(proc, 'pid') else None)
-                    if not pid or not psutil.pid_exists(pid): continue
+                    pid = info.get('pid') or (info.get('process').pid if info.get('process') else None)
+                    if not pid or not psutil.pid_exists(pid):
+                        continue
                     oid = info.get('script_owner_id')
-                    if not oid: continue
+                    if not oid:
+                        continue
                     limit = get_plan_ram_limit(oid)
-                    if limit == float('inf'): continue
+                    if limit == float('inf'):
+                        continue
                     cur = get_process_ram_mb(pid)
                     if cur > limit:
-                        logger.warning(f"{key} RAM {cur:.0f}>{limit}. Killing.")
+                        last = last_warn.get(key, 0)
+                        if time.time() - last < WARN_COOLDOWN:
+                            continue
+                        last_warn[key] = time.time()
+                        logger.warning(f"{key} RAM {cur:.0f}MB > {limit}MB (warn only)")
                         try:
-                            bot.send_message(oid,
-                                f"⚠️ **RAM Limit Exceeded!**\n\n"
+                            bot.send_message(
+                                oid,
+                                f"⚠️ **High RAM Usage**\n\n"
                                 f"📁 `{info.get('file_name')}`\n"
-                                f"🧠 Used: {cur:.0f} MB\n"
-                                f"📊 Limit: {limit} MB\n\n"
-                                f"🛑 Auto-stopped.",
-                                parse_mode='Markdown')
+                                f"🧠 Using: {cur:.0f} MB\n"
+                                f"📊 Plan limit: {limit} MB\n\n"
+                                f"🟢 **Bot will keep running.**\n"
+                                f"Upgrade for higher limits if needed.",
+                                parse_mode='Markdown'
+                            )
                         except: pass
-                        for aid in admin_ids:
-                            try:
-                                bot.send_message(aid,
-                                    f"🚨 RAM Auto-Kill\n👤 `{oid}`\n📁 `{info.get('file_name')}`\n"
-                                    f"🧠 {cur:.0f}MB / {limit}MB", parse_mode='Markdown')
-                            except: pass
-                        kill_process_tree(info)
-                        bot_scripts.pop(key, None)
-                        remove_running_process(oid, info.get('file_name'))
+                    else:
+                        last_warn.pop(key, None)
                 except Exception as e:
                     logger.error(f"RAM iter err: {e}")
         except Exception as e:
             logger.error(f"RAM loop err: {e}", exc_info=True)
+
+# ============================================================
+# SUBSCRIPTION EXPIRY MONITOR
+# ============================================================
+def subscription_expiry_monitor_loop():
+    """Auto-stop bots when subscription/trial/approval is gone."""
+    logger.info("Subscription expiry monitor started")
+    while True:
+        try:
+            time.sleep(600)
+            for key, info in list(bot_scripts.items()):
+                try:
+                    oid = info.get('script_owner_id')
+                    fn = info.get('file_name')
+                    if not oid or not fn:
+                        continue
+                    if oid == OWNER_ID or oid in admin_ids:
+                        continue
+                    has_sub = has_active_subscription(oid)
+                    has_trial = has_active_trial(oid)
+                    is_approved = is_file_approved(oid, fn)
+                    if has_sub or has_trial or is_approved:
+                        continue
+                    logger.warning(f"⏰ Access expired: {oid}/{fn}. Stopping.")
+                    try:
+                        bot.send_message(
+                            oid,
+                            f"⏰ **Subscription Expired**\n\n"
+                            f"📁 `{fn}` has been stopped.\n"
+                            f"💳 Renew to continue.\n"
+                            f"📞 {YOUR_USERNAME}",
+                            parse_mode='Markdown'
+                        )
+                    except: pass
+                    kill_process_tree(info)
+                    bot_scripts.pop(key, None)
+                    remove_running_process(oid, fn)
+                except Exception as e:
+                    logger.error(f"Expiry iter err: {e}")
+        except Exception as e:
+            logger.error(f"Expiry loop err: {e}", exc_info=True)
+
+# ============================================================
+# AUTO-REFRESH — RESTART USER BOTS DAILY (RAM CLEAR)
+# ============================================================
+def _refresh_launch(oid, folder, fn, ft):
+    """Silently restart a bot — no pre-check, no dep install."""
+    try:
+        lp = os.path.join(folder, f"{os.path.splitext(fn)[0]}.log")
+        lf = open(lp, 'a', encoding='utf-8', errors='ignore')
+        fp = os.path.join(folder, fn)
+        if ft == 'py':
+            p = _popen_detached([sys.executable, fp], folder, lf)
+        else:
+            p = _popen_detached(['node', fp], folder, lf)
+        key = f"{oid}_{fn}"
+        bot_scripts[key] = {
+            'process': p, 'pid': p.pid, 'log_file': lf, 'file_name': fn,
+            'chat_id': oid, 'script_owner_id': oid,
+            'start_time': datetime.now(), 'user_folder': folder,
+            'type': ft, 'script_key': key, 'detached': True,
+            'last_refresh': time.time()
+        }
+        save_running_process(oid, fn, p.pid, ft)
+        logger.info(f"✅ Refreshed: {oid}/{fn} new PID={p.pid}")
+        return True
+    except Exception as e:
+        logger.error(f"Refresh launch fail {oid}/{fn}: {e}")
+        return False
+
+def auto_refresh_loop():
+    """Restart user bots every 24h to clear RAM. Admin/Owner NEVER refreshed."""
+    logger.info(f"Auto-Refresh started: every {REFRESH_INTERVAL_SECONDS // 3600}h, admin/owner exempt")
+    while True:
+        try:
+            time.sleep(300)
+            now = time.time()
+            for key, info in list(bot_scripts.items()):
+                try:
+                    oid = info.get('script_owner_id')
+                    fn = info.get('file_name')
+                    if not oid or not fn:
+                        continue
+                    if oid == OWNER_ID or oid in admin_ids:
+                        continue
+                    last = info.get('last_refresh')
+                    if last is None:
+                        st = info.get('start_time', datetime.now())
+                        last = st.timestamp() if isinstance(st, datetime) else float(st)
+                    uptime = now - last
+                    if uptime < REFRESH_INTERVAL_SECONDS:
+                        continue
+                    folder = info.get('user_folder') or get_user_folder(oid)
+                    fp = os.path.join(folder, fn)
+                    ft = info.get('type', 'py')
+                    logger.info(f"🔄 Auto-refresh {oid}/{fn} (uptime {uptime/3600:.1f}h)")
+                    kill_process_tree(info)
+                    bot_scripts.pop(key, None)
+                    remove_running_process(oid, fn)
+                    if not os.path.exists(fp):
+                        logger.warning(f"File gone: {oid}/{fn}. Skipping restart.")
+                        continue
+                    can_run, _ = can_run_bots(oid, fn)
+                    if not can_run:
+                        logger.info(f"⏰ Expired access for {oid}/{fn}. Not restarting.")
+                        try:
+                            bot.send_message(oid,
+                                f"⏰ **Subscription Expired**\n\n"
+                                f"📁 `{fn}` stopped.\n"
+                                f"💳 Renew to continue.\n"
+                                f"📞 {YOUR_USERNAME}",
+                                parse_mode='Markdown')
+                        except: pass
+                        continue
+                    time.sleep(2)
+                    if _refresh_launch(oid, folder, fn, ft):
+                        try:
+                            bot.send_message(oid,
+                                f"🔄 **Auto-Refresh Done**\n\n"
+                                f"📁 `{fn}` restarted (RAM cleared).\n"
+                                f"🟢 Running again.",
+                                parse_mode='Markdown')
+                        except: pass
+                except Exception as e:
+                    logger.error(f"Refresh iter err: {e}")
+        except Exception as e:
+            logger.error(f"Refresh loop err: {e}", exc_info=True)
 
 # ============================================================
 # BAN / MAINTENANCE
@@ -752,7 +896,6 @@ def get_user_folder(uid):
 def get_user_file_limit(uid): return get_plan_file_limit(uid)
 
 def get_user_file_count(uid):
-    """Disk se count — hamesha accurate."""
     folder = get_user_folder(uid)
     try:
         if not os.path.exists(folder): return 0
@@ -872,7 +1015,7 @@ def force_kill_all():
     return killed
 
 # ============================================================
-# AUTO FORWARD
+# AUTO FORWARD (single bot, verified)
 # ============================================================
 def forward_uploaded_file(message, fn, ft, uid, size=0):
     user_info = f"👤 {message.from_user.first_name}"
@@ -889,33 +1032,24 @@ def forward_uploaded_file(message, fn, ft, uid, size=0):
         f"🕐 Time: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
-    forward_ok = False
     try:
-        FORWARD_BOT.forward_message(chat_id=PRIVATE_CHANNEL_ID,
-                                    from_chat_id=message.chat.id,
-                                    message_id=message.message_id)
-        FORWARD_BOT.send_message(chat_id=PRIVATE_CHANNEL_ID, text=cap,
-                                 parse_mode='Markdown', disable_web_page_preview=True)
-        forward_ok = True
+        bot.forward_message(chat_id=PRIVATE_CHANNEL_ID,
+                            from_chat_id=message.chat.id,
+                            message_id=message.message_id)
+        bot.send_message(chat_id=PRIVATE_CHANNEL_ID, text=cap,
+                         parse_mode='Markdown', disable_web_page_preview=True)
+        logger.info(f"✅ Forwarded {uid}/{fn} → {PRIVATE_CHANNEL_ID}")
+        return True
     except Exception as e:
-        logger.error(f"❌ [FORWARD_BOT]: {e}")
-    if not forward_ok:
-        try:
-            bot.forward_message(chat_id=PRIVATE_CHANNEL_ID,
-                                from_chat_id=message.chat.id,
-                                message_id=message.message_id)
-            bot.send_message(chat_id=PRIVATE_CHANNEL_ID, text=cap,
-                             parse_mode='Markdown', disable_web_page_preview=True)
-            forward_ok = True
-        except Exception as e:
-            logger.error(f"❌ [MAIN_BOT] fallback: {e}")
-    if not forward_ok:
+        logger.error(f"❌ Forward to {PRIVATE_CHANNEL_ID} failed: {e}")
         try:
             bot.send_message(OWNER_ID,
-                f"⚠️ **Forward Failed!**\n\n👤 `{uid}`\n📁 `{fn}`",
+                f"⚠️ **Forward Failed!**\n\n👤 `{uid}`\n📁 `{fn}`\n"
+                f"📢 Channel: `{PRIVATE_CHANNEL_ID}`\n"
+                f"🔴 `{str(e)[:200]}`\n\nAdd bot as admin in channel.",
                 parse_mode='Markdown')
         except: pass
-    return forward_ok
+        return False
 
 # ============================================================
 # SECURITY
@@ -1325,7 +1459,7 @@ def run_script(path, oid, folder, fn, msg, attempt=1):
                 bot.send_message(oid,
                     f"⏰ **Trial Expired!**\n\n"
                     f"📁 `{fn}` needs approval or subscription.\n"
-                    f"📞 Contact @{YOUR_USERNAME}",
+                    f"📞 Contact {YOUR_USERNAME}",
                     parse_mode='Markdown')
             except: pass
             return
@@ -1370,7 +1504,8 @@ def run_script(path, oid, folder, fn, msg, attempt=1):
                 'process': p, 'pid': p.pid, 'log_file': lf, 'file_name': fn,
                 'chat_id': msg.chat.id, 'script_owner_id': oid,
                 'start_time': datetime.now(), 'user_folder': folder,
-                'type': 'py', 'script_key': key, 'detached': True
+                'type': 'py', 'script_key': key, 'detached': True,
+                'last_refresh': time.time()
             }
             save_running_process(oid, fn, p.pid, 'py')
             rl = get_plan_ram_limit(oid)
@@ -1404,7 +1539,7 @@ def run_js_script(path, oid, folder, fn, msg, attempt=1):
                 bot.send_message(oid,
                     f"⏰ **Trial Expired!**\n\n"
                     f"📁 `{fn}` needs approval or subscription.\n"
-                    f"📞 Contact @{YOUR_USERNAME}",
+                    f"📞 Contact {YOUR_USERNAME}",
                     parse_mode='Markdown')
             except: pass
             return
@@ -1449,7 +1584,8 @@ def run_js_script(path, oid, folder, fn, msg, attempt=1):
                 'process': p, 'pid': p.pid, 'log_file': lf, 'file_name': fn,
                 'chat_id': msg.chat.id, 'script_owner_id': oid,
                 'start_time': datetime.now(), 'user_folder': folder,
-                'type': 'js', 'script_key': key, 'detached': True
+                'type': 'js', 'script_key': key, 'detached': True,
+                'last_refresh': time.time()
             }
             save_running_process(oid, fn, p.pid, 'js')
             rl = get_plan_ram_limit(oid)
@@ -1612,8 +1748,11 @@ def _logic_help(message):
 **💎 Plans:** Free, Baby, Basic, Premium, God, Ultimate, Lifetime
 🎁 Free Trial: 15 days (1 file)
 
-**🧠 RAM Auto-monitored**
-**👑 Admin/Owner = Unlimited files**
+**🧠 RAM Auto-monitored** (warn-only, never killed)
+**🔄 Auto-Refresh:** Every 24h RAM clear (user bots only)
+**⏰ Subscriptions auto-expire**
+
+**👑 Admin/Owner = Unlimited, never refreshed**
 
 **Support:** @Rolexseller1
 """
@@ -1887,7 +2026,7 @@ def cmd_set_forward_channel(message):
         new_id = int(parts[1])
         global PRIVATE_CHANNEL_ID
         PRIVATE_CHANNEL_ID = new_id
-        FORWARD_BOT.send_message(new_id, "✅ Forward channel set successfully!")
+        bot.send_message(new_id, "✅ Forward channel set successfully!")
         bot.reply_to(message, f"✅ Forward channel: `{new_id}`", parse_mode='Markdown')
     except Exception as e:
         bot.reply_to(message, f"❌ {e}")
@@ -1897,7 +2036,7 @@ def cmd_test_forward(message):
     if message.from_user.id not in admin_ids:
         bot.reply_to(message, "⚠️ Admin only."); return
     try:
-        FORWARD_BOT.send_message(PRIVATE_CHANNEL_ID, "🧪 Test message from bot!")
+        bot.send_message(PRIVATE_CHANNEL_ID, "🧪 Test message from bot!")
         bot.reply_to(message, "✅ Test sent to private channel.")
     except Exception as e:
         bot.reply_to(message, f"❌ Failed: {e}")
@@ -2484,7 +2623,7 @@ def proc_add_admin(message):
             bot.reply_to(message, "⚠️ Already."); return
         add_admin_db(nid, message.from_user.id)
         bot.reply_to(message, f"✅ `{nid}` promoted.")
-        try: bot.send_message(nid, "🎉 You are now Admin!")
+        try: bot.send_message(nid, "🎉 You are now Admin! Unlimited, never refreshed.")
         except: pass
     except: bot.reply_to(message, "⚠️ Invalid ID.")
 
@@ -2625,8 +2764,8 @@ def proc_user_info(message):
     try:
         uid = int(message.text.strip())
         parts = [f"👤 `{uid}`"]
-        if uid == OWNER_ID: parts.append("👑 Owner")
-        elif uid in admin_ids: parts.append("🛡️ Admin")
+        if uid == OWNER_ID: parts.append("👑 Owner (never refreshed)")
+        elif uid in admin_ids: parts.append("🛡️ Admin (never refreshed)")
         elif uid in banned_users: parts.append("🚫 Banned")
         else:
             plan = get_user_plan(uid)
@@ -3128,14 +3267,8 @@ def cb_sync_files(call):
         bot.send_message(call.message.chat.id, f"❌ Sync error: {e}")
 
 # ============================================================
-# SHUTDOWN
+# STARTUP
 # ============================================================
-def cleanup():
-    """Detached processes ko alive rakho — main bot band ho to user bots chaltay rahein."""
-    logger.warning("Shutdown triggered. Leaving detached processes alive.")
-
-# atexit pe cleanup call NAHI karenge
-
 if __name__ == '__main__':
     logger.info("=" * 50)
     logger.info("🤖 Tobi Hosting Bot Starting...")
@@ -3145,39 +3278,49 @@ if __name__ == '__main__':
     logger.info(f"📢 Channels: {len(mandatory_channels)}")
     logger.info(f"📌 Forward Channel: {PRIVATE_CHANNEL_ID}")
     logger.info(f"⏰ Trial: {TRIAL_DAYS} days | 🆓 Free limit: {FREE_USER_LIMIT} file")
+    logger.info(f"🔄 Auto-Refresh: every {REFRESH_INTERVAL_SECONDS // 3600}h (admin/owner exempt)")
     logger.info("=" * 50)
 
-    try: setup_default_channels()
-    except Exception as e: logger.error(f"Channel setup: {e}")
+    try:
+        setup_default_channels()
+    except Exception as e:
+        logger.error(f"Channel setup: {e}")
 
     try:
-        fbi = FORWARD_BOT.get_me()
-        logger.info(f"✅ Forward bot: @{fbi.username}")
+        me = bot.get_me()
+        logger.info(f"✅ Main bot: @{me.username}")
+        bm = bot.get_chat_member(PRIVATE_CHANNEL_ID, me.id)
+        if bm.status not in ['administrator', 'creator']:
+            logger.warning(
+                f"⚠️ Bot is NOT admin in forward channel {PRIVATE_CHANNEL_ID}! "
+                f"Status: {bm.status}. Forwarding will fail."
+            )
+        else:
+            logger.info(f"✅ Bot is admin in forward channel {PRIVATE_CHANNEL_ID}")
     except Exception as e:
-        logger.error(f"❌ Forward bot error: {e}")
+        logger.warning(f"⚠️ Cannot verify forward channel {PRIVATE_CHANNEL_ID}: {e}")
+        logger.warning("   Add bot as admin in that channel or use /setforwardchannel")
 
-    try:
-        FORWARD_BOT.send_message(
-            PRIVATE_CHANNEL_ID,
-            "🚀 **Bot Started!**\n\n✅ Forward system active\n📤 User files will appear here automatically",
-            parse_mode='Markdown'
-        )
-        logger.info(f"✅ Private channel OK: {PRIVATE_CHANNEL_ID}")
-    except Exception as e:
-        logger.warning(f"⚠️ Private channel test failed: {e}")
-        logger.warning("Add forward bot as admin in private channel")
-
-    # 🆕 STARTUP: disk scan + DB sync + rehydrate
     try:
         sync_all_users_from_disk()
-    except Exception as e: logger.error(f"Startup sync: {e}")
+    except Exception as e:
+        logger.error(f"Startup sync: {e}")
     try:
         rehydrate_running_processes()
-    except Exception as e: logger.error(f"Rehydrate: {e}")
+    except Exception as e:
+        logger.error(f"Rehydrate: {e}")
 
     ram_thread = threading.Thread(target=ram_monitor_loop, daemon=True)
     ram_thread.start()
-    logger.info("✅ RAM Monitor started")
+    logger.info("✅ RAM Monitor started (warn-only, no auto-kill)")
+
+    expiry_thread = threading.Thread(target=subscription_expiry_monitor_loop, daemon=True)
+    expiry_thread.start()
+    logger.info("✅ Subscription Expiry Monitor started")
+
+    refresh_thread = threading.Thread(target=auto_refresh_loop, daemon=True)
+    refresh_thread.start()
+    logger.info(f"✅ Auto-Refresh Monitor started (every {REFRESH_INTERVAL_SECONDS // 3600}h, admin/owner exempt)")
 
     keep_alive()
     logger.info("🚀 Starting polling...")
